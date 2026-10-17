@@ -6,12 +6,16 @@ import re
 import signal
 import sys
 import tempfile
+import secrets
+import time
+import shutil
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from downloader import validate_url
+from urllib.parse import urlsplit
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
@@ -58,6 +62,44 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError as exc:
         await message.reply_text(str(exc))
         return
+    if urlsplit(url).hostname in {'youtu.be', 'www.youtu.be', 'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'}:
+        key = secrets.token_hex(6)
+        context.user_data['quality_request'] = (key, url, time.monotonic(), message.chat_id)
+        buttons = [[InlineKeyboardButton(f'{height}p', callback_data=f'q:{user}:{key}:{height}')
+                    for height in (360, 720, 1080)]]
+        await message.reply_text(
+            'Выбери качество YouTube (до указанного разрешения). Если его нет, скачаю ближайшее ниже.\n'
+            'Если файл превышает лимит Telegram, он будет сжат; качество может снизиться.\n'
+            'Кнопки действуют 15 минут, до отправки следующей ссылки YouTube.',
+            reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    await process_download(message, user, url, 720)
+
+
+async def choose_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, owner, key, height = query.data.split(':')
+    if query.from_user.id != int(owner):
+        await query.answer('Это выбор другого пользователя.', show_alert=True)
+        return
+    if allowed and query.from_user.id not in allowed:
+        await query.answer('Бот доступен только владельцу.', show_alert=True)
+        return
+    pending = context.user_data.get('quality_request')
+    if (not pending or pending[0] != key or time.monotonic() - pending[2] > 900
+            or pending[3] != query.message.chat_id):
+        await query.answer('Кнопки устарели. Пришли ссылку заново.', show_alert=True)
+        return
+    if query.from_user.id in active or len(active) >= 6:
+        await query.answer('Подожди завершения текущих загрузок и нажми снова.', show_alert=True)
+        return
+    context.user_data.pop('quality_request')
+    await query.answer()
+    await query.edit_message_text(f'Выбрано качество до {height}p.')
+    await process_download(query.message, query.from_user.id, pending[1], int(height))
+
+
+async def process_download(message, user, url, height):
     if user in active:
         await message.reply_text('Твоё предыдущее видео ещё обрабатывается. Подожди немного.')
         return
@@ -71,7 +113,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with slots:
             with tempfile.TemporaryDirectory(prefix='tg-video-') as folder:
                 proc = await asyncio.create_subprocess_exec(
-                    sys.executable, str(Path(__file__).with_name('downloader.py')), url, folder,
+                    sys.executable, str(Path(__file__).with_name('downloader.py')), url, folder, str(height),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                     start_new_session=os.name == 'posix')
                 try:
@@ -107,8 +149,16 @@ def main():
     token = os.environ.get('BOT_TOKEN')
     if not token:
         raise SystemExit('Set BOT_TOKEN in .env')
+    # A forced restart cannot run TemporaryDirectory's normal cleanup.
+    # This service owns these temporary folders and runs as a single instance.
+    if os.name == 'posix':
+        root = Path(tempfile.gettempdir()).resolve()
+        for folder in root.glob('tg-video-*'):
+            if folder.is_dir() and not folder.is_symlink() and folder.resolve().parent == root:
+                shutil.rmtree(folder)
     app = Application.builder().token(token).concurrent_updates(8).build()
     app.add_handler(CommandHandler(['start', 'help'], start))
+    app.add_handler(CallbackQueryHandler(choose_quality, pattern=r'^q:\d+:[0-9a-f]{12}:(360|720|1080)$'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     app.add_error_handler(error_handler)
     app.run_polling(drop_pending_updates=False)

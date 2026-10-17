@@ -98,7 +98,7 @@ def run(command):
     return result.stdout
 
 
-def prepare(path, folder, index):
+def prepare(path, folder, index, height=720):
     probe = json.loads(run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)]))
     duration = float(probe['format'].get('duration') or 0)
     video = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
@@ -110,11 +110,11 @@ def prepare(path, folder, index):
     if path.stat().st_size <= LIMIT and path.suffix == '.mp4' and video['codec_name'] == 'h264' and (not audio or audio['codec_name'] == 'aac'):
         return path
     target = folder / f'ready-{index}.mp4'
-    bitrate = min(2500, int(LIMIT * 8 / duration / 1000 * .90) - 96)
+    bitrate = min(5000 if height == 1080 else 2500, int(LIMIT * 8 / duration / 1000 * .90) - 96)
     if bitrate < 100:
         raise RuntimeError('Видео слишком большое для отправки в Telegram.')
     run(['ffmpeg', '-y', '-v', 'error', '-i', str(path), '-map', '0:v:0', '-map', '0:a:0?',
-         '-vf', "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+         '-vf', f"scale=w='min({height * 16 // 9},iw)':h='min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
          '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', f'{bitrate}k', '-maxrate', f'{bitrate}k',
          '-bufsize', f'{bitrate * 2}k', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k',
          '-movflags', '+faststart', str(target)])
@@ -123,13 +123,20 @@ def prepare(path, folder, index):
     return target
 
 
-def download(url, folder):
+def format_selector(height):
+    if height not in (360, 720, 1080):
+        raise ValueError('Неподдерживаемое качество.')
+    return (f'bv*[height<={height}][ext=mp4]+ba[ext=m4a]/'
+            f'b[height<={height}][ext=mp4]/bv*[height<={height}]+ba/b[height<={height}]')
+
+
+def download(url, folder, height=720):
     def guard(status):
         if status.get('downloaded_bytes', 0) > 250 * 1024 * 1024:
             raise RuntimeError('Видео слишком большое для обработки.')
     options = {
         'outtmpl': str(folder / '%(id)s.%(ext)s'), 'noplaylist': True, 'playlistend': 5,
-        'format': 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
+        'format': format_selector(height) if 'youtu' in urlsplit(url).hostname else 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
         'merge_output_format': 'mp4', 'max_filesize': 250 * 1024 * 1024,
         'socket_timeout': 20, 'retries': 2, 'fragment_retries': 2,
         'quiet': True, 'logger': QuietLogger(), 'progress_hooks': [guard],
@@ -145,12 +152,12 @@ def download(url, folder):
     sources = sorted(p for p in folder.iterdir() if p.suffix in ('.mp4', '.webm', '.mkv', '.mov'))
     if not sources:
         raise RuntimeError('Видео недоступно, слишком длинное или превышает лимит размера.')
-    return [str(prepare(path, folder, i)) for i, path in enumerate(sources[:5])]
+    return [str(prepare(path, folder, i, height)) for i, path in enumerate(sources[:5])]
 
 
 if __name__ == '__main__':
     try:
-        files = download(sys.argv[1], Path(sys.argv[2]))
+        files = download(sys.argv[1], Path(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else 720)
         print(json.dumps({'files': files}))
     except Exception as exc:
         if isinstance(exc, (RuntimeError, ValueError)):

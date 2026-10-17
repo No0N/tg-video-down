@@ -36,3 +36,20 @@ def test_threads_extractor_precedes_generic():
         dl.add_default_info_extractors()
         selected = next(ie for ie in dl._ies.values() if ie.suitable('https://threads.com/@user/post/abc'))
         assert selected.IE_NAME == ThreadsIE.IE_NAME
+
+
+@pytest.mark.parametrize('height', [360, 720, 1080])
+def test_all_youtube_format_fallbacks_obey_quality_cap(height):
+    import yt_dlp
+    from downloader import format_selector
+    formats = [{'format_id': str(h), 'height': h, 'url': f'https://example.org/{h}.mp4',
+                'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'mp4a'} for h in (144, 360, 720, 1080, 2160)]
+    with yt_dlp.YoutubeDL({'format': format_selector(height), 'quiet': True}) as dl:
+        info = dl.process_ie_result({'id': 'test', 'title': 'test', 'formats': formats}, download=False)
+        assert info['height'] == height
+
+
+def test_quality_rejects_invalid_value():
+    from downloader import format_selector
+    with pytest.raises(ValueError):
+        format_selector(9999)
