@@ -90,7 +90,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status.delete()
     except asyncio.TimeoutError:
         if status:
-            await status.edit_text('Не удалось обработать видео за 5 минут. Попробуй короткое видео или другую ссылку.')
+            await status.edit_text('Обработка заняла слишком много времени. Попробуй короткое видео или другую ссылку.')
     except Exception as exc:
         log.warning('Request failed: %s', type(exc).__name__)
         if status:
