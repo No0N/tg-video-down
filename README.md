@@ -1,0 +1,37 @@
+# Telegram video downloader
+
+Бот принимает одну ссылку и возвращает видео из YouTube/Shorts, Instagram Reels/публикаций и публичных постов Threads. Из публикации отправляет до 5 видео; фото не отправляются. Длительность — до 30 минут. Большие файлы преобразуются в H.264/AAC MP4 до 48 МиБ для стандартного Telegram Bot API.
+
+## Локальный запуск
+
+Нужны Python 3.11+, FFmpeg/ffprobe и Deno 2.3+ для JavaScript-проверок YouTube.
+
+```sh
+python -m venv .venv
+# Linux: source .venv/bin/activate
+# Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env
+# Заполнить BOT_TOKEN
+python bot.py
+```
+
+В `.env` можно указать `ALLOWED_USER_IDS` через запятую. Свой Telegram ID показывает `/start`. Пустой список разрешает пользоваться ботом всем. `COOKIES_FILE` — путь к cookies в формате Netscape, если сайт требует авторизации. Не добавляйте cookies или секреты в Git.
+
+## Сервер
+
+Код: `/opt/tg-video-down`. Окружение: `/opt/tg-video-down/.venv`. Секреты: `/etc/tg-video-down.env` (root, 0600). Сервис запускается от отдельного пользователя `tgvideobot`; временные файлы автоматически удаляются после запроса. Обработчики работают в отдельных процессах, таймаут убивает и скачивание, и дочерний FFmpeg. Параллельно обрабатываются два запроса, очередь ограничена шестью пользователями.
+
+```sh
+systemctl status tg-video-down
+journalctl -u tg-video-down -n 50 --no-pager
+systemctl restart tg-video-down
+```
+
+Unit-файл: `deploy/tg-video-down.service`. Для обновления кода скопируйте файлы в `/opt/tg-video-down`, обновите зависимости внутри venv и перезапустите сервис. При изменении сайтов может потребоваться обновить yt-dlp: `.venv/bin/pip install -U 'yt-dlp[default]'`.
+
+## Ограничения
+
+Поддержка ссылок не гарантирует доступность каждого ролика. YouTube может ограничивать IP дата-центров и требовать cookies/PO token; Instagram — авторизацию. Закрытые, удалённые, платные и защищённые DRM материалы не поддерживаются. Threads использует отдельный обработчик встроенных данных страницы; изменение разметки платформы может потребовать его обновления. Короткие ссылки Threads должны разрешаться в канонический пост, иначе бот просит другую ссылку, чтобы не отправить чужое видео из рекомендаций.
+
+Проверки: `pip install pytest && python -m pytest -q`.
