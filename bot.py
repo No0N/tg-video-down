@@ -17,6 +17,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from downloader import validate_url
 from urllib.parse import urlsplit
+from stats import Stats
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
@@ -26,14 +27,88 @@ log = logging.getLogger(__name__)
 active = set()
 slots = asyncio.Semaphore(2)
 allowed = {int(x.strip()) for x in os.getenv('ALLOWED_USER_IDS', '').split(',') if x.strip()}
+admin_id = int(os.getenv('ADMIN_USER_ID', '0'))
+stats_store = None
+
+
+def remember(user):
+    if stats_store:
+        stats_store.touch(user.id, user.full_name, user.username)
+
+
+def stats_page(kind='overview', page=1, user_id=None):
+    if kind == 'overview':
+        text = stats_store.overview()
+        page, pages = 1, 1
+    else:
+        text, page, pages = stats_store.listing(kind, page, user_id)
+    target = f'user:{user_id}' if user_id is not None else kind
+    buttons = []
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton('← Назад', callback_data=f's:{target}:{page-1}'))
+    if page < pages:
+        nav.append(InlineKeyboardButton('Далее →', callback_data=f's:{target}:{page+1}'))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton('Обзор', callback_data='s:overview:1'),
+                    InlineKeyboardButton('Пользователи', callback_data='s:users:1'),
+                    InlineKeyboardButton('История', callback_data='s:recent:1')])
+    if kind == 'users':
+        text += '\n\nИстория человека: /stats ID (например, /stats 139640926)'
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != admin_id or update.effective_chat.type != 'private':
+        await update.effective_message.reply_text('Статистика доступна только владельцу в личном чате с ботом.')
+        return
+    args = context.args
+    kind, page, user_id = 'overview', 1, None
+    try:
+        if args:
+            if args[0] in ('users', 'recent'):
+                kind = args[0]
+            else:
+                user_id = int(args[0])
+                if not 0 < user_id < 2**63:
+                    raise ValueError()
+                kind = 'recent'
+            if len(args) > 1:
+                page = int(args[1])
+            if len(args) > 2:
+                raise ValueError()
+    except ValueError:
+        await update.effective_message.reply_text('Команды: /stats, /stats users, /stats recent, /stats ID. Для списков можно дописать номер страницы.')
+        return
+    text, keyboard = stats_page(kind, page, user_id)
+    await update.effective_message.reply_text(text, reply_markup=keyboard)
+
+
+async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != admin_id or query.message.chat.type != 'private':
+        await query.answer('Доступ только владельцу в личном чате.', show_alert=True)
+        return
+    parts = query.data.split(':')
+    kind = parts[1]
+    user_id = int(parts[2]) if kind == 'user' else None
+    page = int(parts[-1])
+    text, keyboard = stats_page('recent' if user_id else kind, page, user_id)
+    await query.answer()
+    # Telegram rejects edits whose text and keyboard have not changed.
+    if query.message.text != text or query.message.reply_markup != keyboard:
+        await query.edit_message_text(text, reply_markup=keyboard)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember(update.effective_user)
     await update.effective_message.reply_text(
         'Пришли ссылку на видео YouTube (включая Shorts), Instagram Reels/публикацию или Threads.\n'
         'Скачаю и пришлю видео сюда. До 30 минут, до 5 видео из публикации. '
         'Большие файлы сжимаю. Закрытые публикации могут быть недоступны.\n'
-        'Скачивай материалы, которые тебе разрешено сохранять. Твой ID: ' + str(update.effective_user.id))
+        'Скачивай материалы, которые тебе разрешено сохранять. Твой ID: ' + str(update.effective_user.id)
+        + ('\nСтатистика владельца: /stats' if update.effective_user.id == admin_id else ''))
 
 
 async def stop_worker(proc):
@@ -54,6 +129,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if allowed and user not in allowed:
         await message.reply_text('Бот доступен только владельцу.')
         return
+    remember(update.effective_user)
     urls = re.findall(r'https?://[^\s<>]+', message.text or '')
     if len(urls) != 1:
         await message.reply_text('Пришли одну ссылку на видео YouTube, Instagram или Threads.')
@@ -109,7 +185,11 @@ async def process_download(message, user, url, height):
         return
     active.add(user)
     status = None
+    request_id = None
+    outcome = 'error'
     try:
+        if stats_store:
+            request_id = stats_store.begin(user, url, height)
         status = await message.reply_text('Ссылка принята. Скачиваю видео…')
         async with slots:
             with tempfile.TemporaryDirectory(prefix='tg-video-') as folder:
@@ -135,8 +215,12 @@ async def process_download(message, user, url, height):
                                                   width=metadata['width'], height=metadata['height'],
                                                   duration=metadata['duration'],
                                                   read_timeout=180, write_timeout=180)
+                    if request_id is not None:
+                        stats_store.sent(request_id)
+                outcome = 'success'
                 await status.delete()
     except asyncio.TimeoutError:
+        outcome = 'timeout'
         if status:
             await status.edit_text('Обработка заняла слишком много времени. Попробуй короткое видео или другую ссылку.')
     except Exception as exc:
@@ -145,6 +229,8 @@ async def process_download(message, user, url, height):
             await status.edit_text('Не удалось обработать или отправить видео. Попробуй позже.')
     finally:
         active.discard(user)
+        if request_id is not None:
+            stats_store.finish(request_id, outcome)
 
 
 async def error_handler(update, context):
@@ -152,9 +238,12 @@ async def error_handler(update, context):
 
 
 def main():
+    global stats_store
     token = os.environ.get('BOT_TOKEN')
     if not token:
         raise SystemExit('Set BOT_TOKEN in .env')
+    stats_store = Stats(os.getenv('STATS_DB_PATH', 'data/stats.sqlite3'))
+    stats_store.recover()
     # A forced restart cannot run TemporaryDirectory's normal cleanup.
     # This service owns these temporary folders and runs as a single instance.
     if os.name == 'posix':
@@ -164,6 +253,8 @@ def main():
                 shutil.rmtree(folder)
     app = Application.builder().token(token).concurrent_updates(8).build()
     app.add_handler(CommandHandler(['start', 'help'], start))
+    app.add_handler(CommandHandler('stats', show_stats))
+    app.add_handler(CallbackQueryHandler(stats_callback, pattern=r'^s:(?:(?:overview|users|recent):\d{1,9}|user:[1-9]\d{0,17}:\d{1,9})$'))
     app.add_handler(CallbackQueryHandler(choose_quality, pattern=r'^q:\d+:[0-9a-f]{12}:(360|720|1080)$'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     app.add_error_handler(error_handler)

@@ -7,3 +7,6 @@ __pycache__/
 .deploy*.py
 cookies.txt
 downloads/
+data/
+*.sqlite3
+*.sqlite3-*
