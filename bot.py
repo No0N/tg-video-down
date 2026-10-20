@@ -9,6 +9,7 @@ import tempfile
 import secrets
 import time
 import shutil
+from contextlib import ExitStack
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -126,8 +127,13 @@ async def process_download(message, user, url, height):
                     return
                 await status.edit_text('Видео готово, отправляю…')
                 for file in result['files']:
-                    with open(file, 'rb') as video:
-                        await message.reply_video(video, supports_streaming=True,
+                    metadata = result['metadata'][file]
+                    with ExitStack() as stack:
+                        video = stack.enter_context(open(file, 'rb'))
+                        thumbnail = stack.enter_context(open(metadata['thumbnail'], 'rb'))
+                        await message.reply_video(video, supports_streaming=True, thumbnail=thumbnail,
+                                                  width=metadata['width'], height=metadata['height'],
+                                                  duration=metadata['duration'],
                                                   read_timeout=180, write_timeout=180)
                 await status.delete()
     except asyncio.TimeoutError:

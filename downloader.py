@@ -4,6 +4,8 @@ import os
 import re
 import subprocess
 import sys
+import math
+from fractions import Fraction
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -98,8 +100,35 @@ def run(command):
     return result.stdout
 
 
+def probe_video(path):
+    return json.loads(run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)]))
+
+
+def pixel_ratio(video):
+    try:
+        ratio = Fraction(video.get('sample_aspect_ratio', '1:1').replace(':', '/'))
+        return ratio if ratio > 0 else Fraction(1)
+    except (ValueError, ZeroDivisionError):
+        return Fraction(1)
+
+
+def rotation(video):
+    return float(next((s['rotation'] for s in video.get('side_data_list', []) if 'rotation' in s),
+                      video.get('tags', {}).get('rotate', 0))) % 360
+
+
+def video_metadata(path, folder, index):
+    probe = probe_video(path)
+    video = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+    thumb = folder / f'thumbnail-{index}.jpg'
+    run(['ffmpeg', '-y', '-v', 'error', '-i', str(path), '-map', '0:v:0', '-frames:v', '1',
+         '-vf', 'scale=320:320:force_original_aspect_ratio=decrease,setsar=1', '-q:v', '5', str(thumb)])
+    return {'width': video['width'], 'height': video['height'],
+            'duration': math.ceil(float(probe['format']['duration'])), 'thumbnail': str(thumb)}
+
+
 def prepare(path, folder, index, height=720):
-    probe = json.loads(run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)]))
+    probe = probe_video(path)
     duration = float(probe['format'].get('duration') or 0)
     video = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
     if not video or duration <= 0:
@@ -107,14 +136,15 @@ def prepare(path, folder, index, height=720):
     if duration > int(os.getenv('MAX_DURATION', '1800')):
         raise RuntimeError('Видео слишком длинное. Максимум — 30 минут.')
     audio = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
-    if path.stat().st_size <= LIMIT and path.suffix == '.mp4' and video['codec_name'] == 'h264' and (not audio or audio['codec_name'] == 'aac'):
+    if (path.stat().st_size <= LIMIT and path.suffix == '.mp4' and video['codec_name'] == 'h264'
+            and (not audio or audio['codec_name'] == 'aac') and pixel_ratio(video) == 1 and rotation(video) == 0):
         return path
     target = folder / f'ready-{index}.mp4'
     bitrate = min(5000 if height == 1080 else 2500, int(LIMIT * 8 / duration / 1000 * .90) - 96)
     if bitrate < 100:
         raise RuntimeError('Видео слишком большое для отправки в Telegram.')
     run(['ffmpeg', '-y', '-v', 'error', '-i', str(path), '-map', '0:v:0', '-map', '0:a:0?',
-         '-vf', f"scale=w='min({height * 16 // 9},iw)':h='min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+         '-vf', f"scale=w='max(2,trunc(iw*sar/2)*2)':h=ih,setsar=1,scale=w='min({height * 16 // 9},iw)':h='min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",
          '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', f'{bitrate}k', '-maxrate', f'{bitrate}k',
          '-bufsize', f'{bitrate * 2}k', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k',
          '-movflags', '+faststart', str(target)])
@@ -158,7 +188,8 @@ def download(url, folder, height=720):
 if __name__ == '__main__':
     try:
         files = download(sys.argv[1], Path(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else 720)
-        print(json.dumps({'files': files}))
+        print(json.dumps({'files': files, 'metadata': {
+            file: video_metadata(Path(file), Path(sys.argv[2]), i) for i, file in enumerate(files)}}))
     except Exception as exc:
         if isinstance(exc, (RuntimeError, ValueError)):
             message = str(exc)

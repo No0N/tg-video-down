@@ -40,3 +40,25 @@ def test_quality_download_is_consumed_once(monkeypatch):
         await bot.choose_quality(SimpleNamespace(callback_query=q), context)
     asyncio.run(scenario())
     worker.assert_awaited_once_with(q.message, 123, 'https://youtu.be/abc', 1080)
+
+
+def test_upload_includes_real_geometry_and_thumbnail(monkeypatch, tmp_path):
+    import json
+    video = tmp_path / 'clip.mp4'
+    thumb = tmp_path / 'thumb.jpg'
+    video.write_bytes(b'video')
+    thumb.write_bytes(b'thumb')
+    payload = {'files': [str(video)], 'metadata': {str(video): {
+        'width': 360, 'height': 640, 'duration': 43, 'thumbnail': str(thumb)}}}
+    proc = SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(json.dumps(payload).encode(), None)))
+    monkeypatch.setattr(bot.asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc))
+    status = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+    message = SimpleNamespace(reply_text=AsyncMock(return_value=status), reply_video=AsyncMock())
+    async def scenario():
+        monkeypatch.setattr(bot, 'slots', asyncio.Semaphore(2))
+        await bot.process_download(message, 123, 'https://youtu.be/abc', 720)
+    asyncio.run(scenario())
+    params = message.reply_video.call_args.kwargs
+    assert (params['width'], params['height'], params['duration']) == (360, 640, 43)
+    assert params['thumbnail'].name == str(thumb)
+    assert 123 not in bot.active
